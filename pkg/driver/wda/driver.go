@@ -662,6 +662,64 @@ func (d *Driver) getElementInfo(elemID string) (*core.ElementInfo, error) {
 	return info, nil
 }
 
+// getElementBoundsOnly fetches just the rect for an element ID, without the
+// visibility check that getElementInfo enforces. Used by the tap fallback
+// path so we can attempt a coordinate tap on elements iOS marks
+// visible="false" but which are at known on-screen coordinates — common
+// when KeyboardAvoidingView shifts a form mid-interaction and the
+// accessibility framework lags reality.
+func (d *Driver) getElementBoundsOnly(elemID string) (*core.ElementInfo, error) {
+	x, y, w, h, err := d.client.ElementRect(elemID)
+	if err != nil {
+		return nil, err
+	}
+	return &core.ElementInfo{
+		ID:      elemID,
+		Enabled: true,
+		Bounds:  core.Bounds{X: x, Y: y, Width: w, Height: h},
+		Visible: false,
+	}, nil
+}
+
+// findElementForTapPermissive attempts to find an element for tapping
+// without requiring it be marked visible. iOS marks elements visible="false"
+// in surprising cases (KeyboardAvoidingView shifts, transient menu
+// overlays). For ID-based taps we trust the testID and tap the bounds.
+//
+// Strategy: try WDA's HTTP find first (fast, but may exclude invisible).
+// If that fails, fall back to the page source XML which lists every
+// element regardless of visibility, then tap at the parsed bounds.
+func (d *Driver) findElementForTapPermissive(sel flow.Selector) (*core.ElementInfo, error) {
+	if sel.ID == "" {
+		return nil, fmt.Errorf("permissive find only supports id selectors")
+	}
+	if id, err := d.client.FindElement("name", sel.ID); err == nil && id != "" {
+		if info, err := d.getElementBoundsOnly(id); err == nil {
+			return info, nil
+		}
+	}
+	// Page-source fallback — includes invisible elements.
+	pageSource, err := d.client.Source()
+	if err != nil {
+		return nil, err
+	}
+	allElements, err := ParsePageSource(pageSource)
+	if err != nil {
+		return nil, err
+	}
+	candidates := FilterBySelector(allElements, sel)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("element not found in page source: %s", sel.ID)
+	}
+	c := candidates[0]
+	return &core.ElementInfo{
+		ID:      c.Name,
+		Enabled: true,
+		Bounds:  c.Bounds,
+		Visible: false,
+	}, nil
+}
+
 // findElementRelativeWithContext handles relative selectors with context-based timeout.
 func (d *Driver) findElementRelativeWithContext(ctx context.Context, sel flow.Selector) (*core.ElementInfo, error) {
 	var lastErr error
@@ -797,14 +855,14 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*core.ElementIn
 
 	candidates := FilterBySelector(allElements, sel)
 
-	// Also filter by WDA's visible attribute
-	visible := candidates[:0]
-	for _, c := range candidates {
-		if c.Displayed {
-			visible = append(visible, c)
-		}
-	}
-	candidates = visible
+	// NOTE: We deliberately do NOT filter by WDA's `Displayed` attribute
+	// here. iOS's accessibility framework reports `visible="false"` in
+	// surprising cases — wizard step headers immediately after a step
+	// transition, form fields below a KeyboardAvoidingView shift, content
+	// during menu-dismiss animations. Geometric on-screen-ness
+	// (FilterOutOfBounds above) is a more reliable signal. Strict
+	// visibility checking remains for explicit assertVisible via the WDA
+	// HTTP find path; this page-source path is the lenient fallback.
 
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no elements match selector")

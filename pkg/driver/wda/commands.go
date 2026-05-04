@@ -32,6 +32,41 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	}
 
 	info, err := d.findElementForTap(step.Selector, step.Optional, step.TimeoutMs)
+
+	// Auto-scroll-into-view recovery for ID-based taps. Triggers when:
+	//   (a) strict find failed, or
+	//   (b) strict find returned an off-screen / iOS-says-invisible element.
+	//
+	// iOS marks elements visible="false" when they're off the visible
+	// scroll viewport — a fresh wizard step's lower inputs, form fields
+	// behind a soft keyboard, etc. Upstream Maestro relies on
+	// XCUIElement.tap()'s implicit scroll-into-view; FB-WDA's coordinate
+	// tap doesn't do that, so we ask WDA to scroll explicitly.
+	//
+	//   1. Permissive find: locate the element regardless of visibility
+	//      and get a WDA element ID for it.
+	//   2. ScrollToVisible: ask WDA to scroll the parent container until
+	//      the element is actually on screen.
+	//   3. Re-find strict: post-scroll bounds will have shifted, so pick
+	//      them up so we tap at the right coordinates.
+	needsScroll := step.Selector.ID != "" && (err != nil || (info != nil && !info.Visible))
+	if needsScroll {
+		if info2, ferr := d.findElementForTapPermissive(step.Selector); ferr == nil && info2.ID != "" {
+			if scrollErr := d.client.ScrollToVisible(info2.ID); scrollErr == nil {
+				time.Sleep(300 * time.Millisecond)
+				if info3, ferr2 := d.findElementForTap(step.Selector, step.Optional, 3000); ferr2 == nil {
+					info, err = info3, nil
+				} else if info != nil {
+					// Keep original info if strict re-find failed but we had one
+				} else {
+					info, err = info2, nil
+				}
+			} else if info == nil {
+				// Scroll endpoint unavailable; tap at off-screen bounds as last resort
+				info, err = info2, nil
+			}
+		}
+	}
 	if err != nil {
 		if step.Optional {
 			return successResult("Optional element not found, skipping tap", nil)
@@ -188,7 +223,14 @@ func (d *Driver) assertNotVisible(step *flow.AssertNotVisibleStep) *core.Command
 
 	for {
 		info, err := d.findElementOnce(step.Selector)
-		if err != nil || info == nil {
+		// We deliberately treat info.Visible == false as "not visible".
+		// findElementByPageSourceOnce no longer filters by iOS's
+		// `displayed` attribute (which is unreliable for off-screen-but-
+		// in-DOM elements), so we'd otherwise see assertNotVisible fail
+		// for elements that aren't actually visible — e.g. an
+		// "empty search" copy that's still in the React tree but
+		// faded out behind a transient animation.
+		if err != nil || info == nil || !info.Visible {
 			return successResult("Element is not visible", nil)
 		}
 
@@ -202,6 +244,72 @@ func (d *Driver) assertNotVisible(step *flow.AssertNotVisibleStep) *core.Command
 
 // Input commands
 
+// pasteIntoFocused replaces or appends text via the iOS edit menu's Paste
+// action, bypassing the iOS 26 XCPointerEventPath typeText regression that
+// synthesizes a stray trailing keystroke on every call.
+//
+// Mirrors the flow from upstream-Maestro's TextInputHelper.swift fork:
+//  1. Push text to the simulator pasteboard (FB-WDA /wda/setPasteboard).
+//  2. Long-press the focused element to summon the edit menu.
+//  3. If "Select All" is present (field has content), tap it to bring up the
+//     replace menu; otherwise the empty-field menu already shows Paste.
+//  4. Tap Paste.
+//
+// Returns nil on success, or an error so the caller can fall back to the
+// legacy SendKeys path (used for backspace payloads from eraseText, which
+// can't be pasted).
+func (d *Driver) pasteIntoFocused(elementID string) error {
+	// Pasteboard write must settle before the edit menu is summoned, or
+	// Paste comes up disabled.
+	time.Sleep(500 * time.Millisecond)
+
+	if elementID == "" {
+		id, err := d.client.GetActiveElement()
+		if err != nil || id == "" {
+			return fmt.Errorf("no focused element")
+		}
+		elementID = id
+	}
+
+	x, y, w, h, err := d.client.ElementRect(elementID)
+	if err != nil {
+		return fmt.Errorf("element rect: %w", err)
+	}
+	cx := float64(x + w/2)
+	cy := float64(y + h/2)
+
+	// Long-press the focused element to bring up the edit menu.
+	if err := d.client.LongPress(cx, cy, 1.0); err != nil {
+		return fmt.Errorf("long press: %w", err)
+	}
+
+	// If the field already has content, "Select All" appears in the menu.
+	// Tap it to select existing text — iOS pops a second menu over the
+	// selection that contains Paste; tapping Paste then *replaces* rather
+	// than *appends*.
+	if id, _ := d.client.FindMenuItem("Select All"); id != "" {
+		_ = d.client.ElementClick(id)
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	pasteID, _ := d.client.FindMenuItem("Paste")
+	if pasteID == "" {
+		return fmt.Errorf("paste menu item not found")
+	}
+	if err := d.client.ElementClick(pasteID); err != nil {
+		return err
+	}
+	// Settle window: iOS commits the paste asynchronously after the menu
+	// item tap, fires the text-changed event, the JS-side onChange
+	// handlers run (often debounced search), and any menu-dismissal
+	// animation has to finish before the accessibility tree marks newly
+	// rendered content as visible. Without this, downstream waitFor
+	// assertions can race and find content visible=false during the
+	// animation window.
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
 func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 	text := step.Text
 	if text == "" {
@@ -214,26 +322,40 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 		unicodeWarning = " (warning: non-ASCII characters may not input correctly)"
 	}
 
+	// Pure backspace payloads (sent by eraseText fallbacks) can't be
+	// pasted — they're control characters, not text. Also, if the runner
+	// is targeting Android we shouldn't attempt the paste workaround.
+	isPureBackspace := true
+	for _, r := range text {
+		if r != '' {
+			isPureBackspace = false
+			break
+		}
+	}
+
 	// If selector provided, find the element and type directly into it
+	var selectorElemID string
 	if !step.Selector.IsEmpty() {
 		info, err := d.findElement(step.Selector, step.IsOptional(), step.TimeoutMs)
 		if err != nil {
 			return errorResult(err, fmt.Sprintf("Element not found: %s", selectorDesc(step.Selector)))
 		}
-		// If we have element ID, send keys directly to the element
 		if info.ID != "" {
-			if err := d.client.ElementSendKeys(info.ID, text, d.typingFrequency); err != nil {
-				return errorResult(err, "Input text to element failed")
+			selectorElemID = info.ID
+			// Tap to ensure focus before paste.
+			x := float64(info.Bounds.X + info.Bounds.Width/2)
+			y := float64(info.Bounds.Y + info.Bounds.Height/2)
+			_ = d.client.Tap(x, y)
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			// No element ID — tap into screen coords to focus.
+			x := float64(info.Bounds.X + info.Bounds.Width/2)
+			y := float64(info.Bounds.Y + info.Bounds.Height/2)
+			if err := d.client.Tap(x, y); err != nil {
+				return errorResult(err, "Failed to tap element before input")
 			}
-			return successResult(fmt.Sprintf("Entered text: %s%s", text, unicodeWarning), info)
+			time.Sleep(100 * time.Millisecond)
 		}
-		// Fallback: tap to focus first
-		x := float64(info.Bounds.X + info.Bounds.Width/2)
-		y := float64(info.Bounds.Y + info.Bounds.Height/2)
-		if err := d.client.Tap(x, y); err != nil {
-			return errorResult(err, "Failed to tap element before input")
-		}
-		time.Sleep(100 * time.Millisecond) // Wait for focus
 	}
 
 	// Wait for keyboard to be ready by confirming a text field is focused.
@@ -244,6 +366,22 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+
+	// iOS 26 typeText regression workaround: route through UIPasteboard +
+	// edit-menu Paste instead of XCPointerEventPath synthesis. Falls back
+	// to legacy SendKeys for backspace payloads or if the paste flow
+	// can't summon a Paste menu item.
+	if !isPureBackspace {
+		if err := d.client.SetPasteboard(text); err == nil {
+			if err := d.pasteIntoFocused(selectorElemID); err == nil {
+				return successResult(fmt.Sprintf("Entered text: %s%s", text, unicodeWarning), nil)
+			} else {
+				logger.Debug("paste path failed, falling back to SendKeys: %v", err)
+			}
+		} else {
+			logger.Debug("setPasteboard failed, falling back to SendKeys: %v", err)
+		}
 	}
 
 	if err := d.client.SendKeys(text, d.typingFrequency); err != nil {
@@ -399,6 +537,22 @@ func (d *Driver) scroll(step *flow.ScrollStep) *core.CommandResult {
 	centerX := float64(width) / 2
 	centerY := float64(height) / 2
 	scrollDistance := float64(height) / 3
+
+	// Keyboard avoidance. If a keyboard is up the lower portion of the
+	// screen is occupied; a swipe that starts inside the keyboard area
+	// gets intercepted by the keyboard and the form doesn't scroll.
+	// Shift the swipe vertically so its lower endpoint stays above the
+	// keyboard top, preserving the swipe distance (and so the scroll
+	// momentum) we'd use without a keyboard.
+	if kbID, kErr := d.client.FindElement("class chain", "**/XCUIElementTypeKeyboard"); kErr == nil && kbID != "" {
+		if _, ky, _, _, rErr := d.client.ElementRect(kbID); rErr == nil && ky > 0 {
+			const buffer = 20.0
+			maxLowerY := float64(ky) - buffer
+			if centerY+scrollDistance/2 > maxLowerY {
+				centerY = maxLowerY - scrollDistance/2
+			}
+		}
+	}
 
 	// Scroll direction = content movement direction
 	// "scroll down" means reveal content below, which requires swiping UP

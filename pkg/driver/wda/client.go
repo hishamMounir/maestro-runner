@@ -228,6 +228,43 @@ func (c *Client) ElementClear(elementID string) error {
 	return err
 }
 
+// SetPasteboard pushes plaintext to the simulator's UIPasteboard via FB-WDA's
+// /wda/setPasteboard endpoint. Used by the paste-based inputText workaround
+// for the iOS 26 XCPointerEventPath typeText regression (stray trailing
+// keystroke). Body shape matches FB-WDA's handleSetPasteboard:
+//
+//	{ "contentType": "plaintext", "content": <base64 utf-8> }
+func (c *Client) SetPasteboard(text string) error {
+	body := map[string]interface{}{
+		"contentType": "plaintext",
+		"content":     base64.StdEncoding.EncodeToString([]byte(text)),
+	}
+	_, err := c.post(c.sessionPath("/wda/setPasteboard"), body)
+	return err
+}
+
+// ScrollToVisible scrolls the parent container of the given element until
+// the element is visible, via FB-WDA's /wda/element/<uuid>/scrollTo. Used
+// by the tap path to bring off-screen form fields into view before tapping
+// — replaces XCUIElement.tap()'s implicit scroll-into-view behavior that
+// upstream Maestro relies on but FB-WDA's coordinate tap doesn't provide.
+func (c *Client) ScrollToVisible(elementID string) error {
+	_, err := c.post(c.sessionPath(fmt.Sprintf("/wda/element/%s/scrollTo", elementID)), map[string]interface{}{})
+	return err
+}
+
+// FindMenuItem finds an iOS edit-menu item ("Paste", "Select All", etc.) by
+// its visible name. Used by the paste-based inputText workaround. Returns
+// empty string when no such item is currently on screen.
+func (c *Client) FindMenuItem(name string) (string, error) {
+	chain := fmt.Sprintf("**/XCUIElementTypeMenuItem[`name == \"%s\"`]", name)
+	id, err := c.FindElement("class chain", chain)
+	if err != nil {
+		return "", nil
+	}
+	return id, nil
+}
+
 // Screen
 
 // Screenshot captures the screen as PNG.
